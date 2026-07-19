@@ -40,8 +40,8 @@ jobs:
       CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
       CODEARTIFACT_REPOSITORY: ${{ vars.CODEARTIFACT_REPOSITORY }}
 
-      # PUBLISHER_ROLE_ARN: arn:aws:iam::230027226493:role/CodeArtifact-Team-Publisher
-      PUBLISHER_ROLE_ARN: arn:aws:iam::461882383780:role/codeartifact/CodeArtifactPublish-devx
+      PUBLISHER_ROLE_ARN: arn:aws:iam::230027226493:role/CodeArtifact-Team-Publisher
+      # PUBLISHER_ROLE_ARN: arn:aws:iam::461882383780:role/codeartifact/CodeArtifactPublish-devx
       EXPECTED_PACKAGE_NAME: "@bbc/a11y"
 
     steps:

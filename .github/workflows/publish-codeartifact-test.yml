@@ -133,9 +133,12 @@ jobs:
 
       - name: Install dependencies
         shell: bash
+        env:
+          ELECTRON_DISABLE_SECURITY_WARNINGS: "true"
         run: |
           set -euo pipefail
-          npm ci --ignore-scripts
+          npm ci
+          node -e "console.log(require('electron'))"
 
       - name: Validate package and prepare test version
         shell: bash
@@ -204,16 +207,16 @@ jobs:
           );
           NODE
 
-      - name: Run available package tests
+      - name: Run package tests
         shell: bash
         run: |
           set -euo pipefail
-
+      
           if node -e '
             const scripts = require("./package.json").scripts || {};
             process.exit(scripts.test ? 0 : 1);
           '; then
-            npm test
+            xvfb-run --auto-servernum npm test
           else
             echo "No npm test script is defined; skipping package tests."
           fi

@@ -39,17 +39,14 @@ jobs:
       CODEARTIFACT_DOMAIN: ${{ vars.CODEARTIFACT_DOMAIN }}
       CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
       CODEARTIFACT_REPOSITORY: ${{ vars.CODEARTIFACT_REPOSITORY }}
-
-      PUBLISHER_ROLE_ARN: >-
-        arn:aws:iam::230027226493:role/CodeArtifact-Team-Publisher
-
+      PUBLISHER_ROLE_ARN: arn:aws:iam::230027226493:role/CodeArtifact-Team-Publisher
       EXPECTED_PACKAGE_NAME: "@bbc/a11y"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate required variables
+      - name: Validate required GitHub variables
         shell: bash
         run: |
           set -euo pipefail
@@ -69,19 +66,64 @@ jobs:
             fi
           done
 
+          if [[ ! "$CODEARTIFACT_DOMAIN_OWNER" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::CODEARTIFACT_DOMAIN_OWNER must be a 12-digit AWS account ID"
+            exit 1
+          fi
+
+      - name: Inspect GitHub OIDC claims
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken("sts.amazonaws.com");
+            const tokenParts = token.split(".");
+
+            if (tokenParts.length !== 3) {
+              core.setFailed("GitHub returned an invalid OIDC token.");
+              return;
+            }
+
+            const payload = JSON.parse(
+              Buffer.from(tokenParts[1], "base64url").toString("utf8")
+            );
+
+            core.info(`OIDC issuer: ${payload.iss}`);
+            core.info(`OIDC audience: ${payload.aud}`);
+            core.info(`OIDC subject: ${payload.sub}`);
+            core.info(`Repository: ${payload.repository}`);
+            core.info(`Repository owner: ${payload.repository_owner}`);
+            core.info(`Repository visibility: ${payload.repository_visibility}`);
+            core.info(`Ref: ${payload.ref}`);
+            core.info(`Environment: ${payload.environment || "not used"}`);
+            core.info(`Job workflow ref: ${payload.job_workflow_ref}`);
+
       - name: Configure AWS credentials using GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.PUBLISHER_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
           role-session-name: codeartifact-a11y-publish-test
           mask-aws-account-id: true
+          retry-max-attempts: 3
 
       - name: Confirm assumed AWS identity
         shell: bash
         run: |
           set -euo pipefail
+
           aws sts get-caller-identity
+
+          assumed_arn="$(
+            aws sts get-caller-identity \
+              --query Arn \
+              --output text
+          )"
+
+          if [[ "$assumed_arn" != *":assumed-role/CodeArtifact-Team-Publisher/"* ]]; then
+            echo "::error::Unexpected assumed identity: ${assumed_arn}"
+            exit 1
+          fi
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -89,7 +131,13 @@ jobs:
           node-version: "20"
           cache: npm
 
-      - name: Validate package name and requested version
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+
+      - name: Validate package and prepare test version
         shell: bash
         env:
           REQUESTED_VERSION: ${{ inputs.package_version }}
@@ -111,6 +159,11 @@ jobs:
             exit 1
           fi
 
+          if [[ -z "$TEST_MARKER" ]]; then
+            echo "::error::test_marker cannot be empty"
+            exit 1
+          fi
+
           npm version "$REQUESTED_VERSION" --no-git-tag-version
 
           node - <<'NODE'
@@ -123,6 +176,8 @@ jobs:
           packageJson.codeartifactTest = {
             marker: process.env.TEST_MARKER,
             repository: process.env.GITHUB_REPOSITORY,
+            ref: process.env.GITHUB_REF,
+            commit: process.env.GITHUB_SHA,
             runId: process.env.GITHUB_RUN_ID
           };
 
@@ -133,28 +188,43 @@ jobs:
           NODE
 
           echo "Prepared package:"
-          node -e '
-            const pkg = require("./package.json");
-            console.log({
-              name: pkg.name,
-              version: pkg.version,
-              codeartifactTest: pkg.codeartifactTest
-            });
-          '
+          node - <<'NODE'
+          const pkg = require("./package.json");
 
-      - name: Install dependencies
+          console.log(
+            JSON.stringify(
+              {
+                name: pkg.name,
+                version: pkg.version,
+                codeartifactTest: pkg.codeartifactTest
+              },
+              null,
+              2
+            )
+          );
+          NODE
+
+      - name: Run available package tests
         shell: bash
         run: |
           set -euo pipefail
-          npm ci --ignore-scripts
 
-      - name: Check package contents
+          if node -e '
+            const scripts = require("./package.json").scripts || {};
+            process.exit(scripts.test ? 0 : 1);
+          '; then
+            npm test
+          else
+            echo "No npm test script is defined; skipping package tests."
+          fi
+
+      - name: Check npm package contents
         shell: bash
         run: |
           set -euo pipefail
           npm pack --dry-run
 
-      - name: Retrieve CodeArtifact endpoint and token
+      - name: Retrieve CodeArtifact endpoint and authorization token
         shell: bash
         run: |
           set -euo pipefail
@@ -177,6 +247,16 @@ jobs:
               --output text
           )"
 
+          if [[ -z "$repository_endpoint" || "$repository_endpoint" == "None" ]]; then
+            echo "::error::CodeArtifact repository endpoint was not returned"
+            exit 1
+          fi
+
+          if [[ -z "$authorization_token" || "$authorization_token" == "None" ]]; then
+            echo "::error::CodeArtifact authorization token was not returned"
+            exit 1
+          fi
+
           registry_host_path="${repository_endpoint#https://}"
 
           {
@@ -192,7 +272,23 @@ jobs:
           echo "CODEARTIFACT_NPM_ENDPOINT=$repository_endpoint" \
             >> "$GITHUB_ENV"
 
-      - name: Confirm version does not already exist
+          echo "CodeArtifact npm endpoint configured successfully."
+
+      - name: Confirm CodeArtifact repository access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws codeartifact describe-domain \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER"
+
+          aws codeartifact describe-repository \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY"
+
+      - name: Confirm package version does not already exist
         shell: bash
         run: |
           set -euo pipefail
@@ -202,16 +298,17 @@ jobs:
           )"
 
           set +e
-          aws codeartifact describe-package-version \
-            --domain "$CODEARTIFACT_DOMAIN" \
-            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
-            --repository "$CODEARTIFACT_REPOSITORY" \
-            --format npm \
-            --namespace bbc \
-            --package a11y \
-            --package-version "$package_version" \
-            >/dev/null 2>&1
-
+          describe_output="$(
+            aws codeartifact describe-package-version \
+              --domain "$CODEARTIFACT_DOMAIN" \
+              --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+              --repository "$CODEARTIFACT_REPOSITORY" \
+              --format npm \
+              --namespace bbc \
+              --package a11y \
+              --package-version "$package_version" \
+              2>&1
+          )"
           describe_exit_code=$?
           set -e
 
@@ -220,7 +317,13 @@ jobs:
             exit 1
           fi
 
-          echo "Version is available: @bbc/a11y@${package_version}"
+          if grep -q "ResourceNotFoundException" <<< "$describe_output"; then
+            echo "Version is available: @bbc/a11y@${package_version}"
+          else
+            echo "::error::Unable to determine whether the package version exists"
+            echo "$describe_output"
+            exit "$describe_exit_code"
+          fi
 
       - name: Publish package to CodeArtifact
         if: ${{ inputs.publish }}
@@ -231,7 +334,7 @@ jobs:
           npm publish \
             --registry "$CODEARTIFACT_NPM_ENDPOINT"
 
-      - name: Verify published package
+      - name: Verify published package version
         if: ${{ inputs.publish }}
         shell: bash
         run: |
@@ -250,12 +353,26 @@ jobs:
             --package a11y \
             --package-version "$package_version"
 
+          npm view \
+            "@bbc/a11y@${package_version}" \
+            name \
+            version \
+            dist.tarball \
+            --registry "$CODEARTIFACT_NPM_ENDPOINT"
+
+      - name: Dry-run result
+        if: ${{ !inputs.publish }}
+        shell: bash
+        run: |
+          echo "Dry run completed successfully. No package was published."
+
       - name: Write workflow summary
         if: always()
         shell: bash
         run: |
           package_version="$(
-            node -p "require('./package.json').version"
+            node -p "require('./package.json').version" 2>/dev/null \
+              || printf '%s' '${{ inputs.package_version }}'
           )"
 
           {
@@ -265,5 +382,9 @@ jobs:
             echo "- Version: \`${package_version}\`"
             echo "- Marker: \`${{ inputs.test_marker }}\`"
             echo "- Publish requested: \`${{ inputs.publish }}\`"
+            echo "- AWS role: \`${PUBLISHER_ROLE_ARN}\`"
+            echo "- Domain: \`${CODEARTIFACT_DOMAIN}\`"
             echo "- Repository: \`${CODEARTIFACT_REPOSITORY}\`"
+            echo "- GitHub repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- Git ref: \`${GITHUB_REF}\`"
           } >> "$GITHUB_STEP_SUMMARY"

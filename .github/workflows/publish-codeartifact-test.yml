@@ -1,0 +1,269 @@
+name: Test publish @bbc/a11y to CodeArtifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: "Unique test version, for example 3.0.0-codeartifact-test.1"
+        required: true
+        type: string
+
+      test_marker:
+        description: "Marker included in package.json to identify this build"
+        required: true
+        default: "first-test"
+        type: string
+
+      publish:
+        description: "Publish package after validation"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: codeartifact-a11y-publish-test
+  cancel-in-progress: false
+
+jobs:
+  validate-and-publish:
+    name: Validate and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      AWS_REGION: ${{ vars.CODEARTIFACT_REGION }}
+      CODEARTIFACT_DOMAIN: ${{ vars.CODEARTIFACT_DOMAIN }}
+      CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
+      CODEARTIFACT_REPOSITORY: ${{ vars.CODEARTIFACT_REPOSITORY }}
+
+      PUBLISHER_ROLE_ARN: >-
+        arn:aws:iam::230027226493:role/CodeArtifact-Team-Publisher
+
+      EXPECTED_PACKAGE_NAME: "@bbc/a11y"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required variables
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_variables=(
+            AWS_REGION
+            CODEARTIFACT_DOMAIN
+            CODEARTIFACT_DOMAIN_OWNER
+            CODEARTIFACT_REPOSITORY
+            PUBLISHER_ROLE_ARN
+          )
+
+          for variable_name in "${required_variables[@]}"; do
+            if [[ -z "${!variable_name:-}" ]]; then
+              echo "::error::Missing required value: ${variable_name}"
+              exit 1
+            fi
+          done
+
+      - name: Configure AWS credentials using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: codeartifact-a11y-publish-test
+          mask-aws-account-id: true
+
+      - name: Confirm assumed AWS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Validate package name and requested version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.package_version }}
+          TEST_MARKER: ${{ inputs.test_marker }}
+        run: |
+          set -euo pipefail
+
+          actual_package_name="$(
+            node -p "require('./package.json').name"
+          )"
+
+          if [[ "$actual_package_name" != "$EXPECTED_PACKAGE_NAME" ]]; then
+            echo "::error::Expected ${EXPECTED_PACKAGE_NAME}, found ${actual_package_name}"
+            exit 1
+          fi
+
+          if [[ ! "$REQUESTED_VERSION" =~ ^3\.0\.0-codeartifact-test\.[0-9]+$ ]]; then
+            echo "::error::Version must match 3.0.0-codeartifact-test.N"
+            exit 1
+          fi
+
+          npm version "$REQUESTED_VERSION" --no-git-tag-version
+
+          node - <<'NODE'
+          const fs = require("fs");
+
+          const packageJson = JSON.parse(
+            fs.readFileSync("package.json", "utf8")
+          );
+
+          packageJson.codeartifactTest = {
+            marker: process.env.TEST_MARKER,
+            repository: process.env.GITHUB_REPOSITORY,
+            runId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.writeFileSync(
+            "package.json",
+            `${JSON.stringify(packageJson, null, 2)}\n`
+          );
+          NODE
+
+          echo "Prepared package:"
+          node -e '
+            const pkg = require("./package.json");
+            console.log({
+              name: pkg.name,
+              version: pkg.version,
+              codeartifactTest: pkg.codeartifactTest
+            });
+          '
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+
+      - name: Check package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --dry-run
+
+      - name: Retrieve CodeArtifact endpoint and token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repository_endpoint="$(
+            aws codeartifact get-repository-endpoint \
+              --domain "$CODEARTIFACT_DOMAIN" \
+              --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+              --repository "$CODEARTIFACT_REPOSITORY" \
+              --format npm \
+              --query repositoryEndpoint \
+              --output text
+          )"
+
+          authorization_token="$(
+            aws codeartifact get-authorization-token \
+              --domain "$CODEARTIFACT_DOMAIN" \
+              --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+              --query authorizationToken \
+              --output text
+          )"
+
+          registry_host_path="${repository_endpoint#https://}"
+
+          {
+            echo "registry=${repository_endpoint}"
+            echo "@bbc:registry=${repository_endpoint}"
+            echo "always-auth=true"
+            echo "//${registry_host_path}:_authToken=${authorization_token}"
+          } > "$RUNNER_TEMP/codeartifact.npmrc"
+
+          echo "::add-mask::$authorization_token"
+          echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/codeartifact.npmrc" \
+            >> "$GITHUB_ENV"
+          echo "CODEARTIFACT_NPM_ENDPOINT=$repository_endpoint" \
+            >> "$GITHUB_ENV"
+
+      - name: Confirm version does not already exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_version="$(
+            node -p "require('./package.json').version"
+          )"
+
+          set +e
+          aws codeartifact describe-package-version \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY" \
+            --format npm \
+            --namespace bbc \
+            --package a11y \
+            --package-version "$package_version" \
+            >/dev/null 2>&1
+
+          describe_exit_code=$?
+          set -e
+
+          if [[ "$describe_exit_code" -eq 0 ]]; then
+            echo "::error::Version already exists: @bbc/a11y@${package_version}"
+            exit 1
+          fi
+
+          echo "Version is available: @bbc/a11y@${package_version}"
+
+      - name: Publish package to CodeArtifact
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm publish \
+            --registry "$CODEARTIFACT_NPM_ENDPOINT"
+
+      - name: Verify published package
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_version="$(
+            node -p "require('./package.json').version"
+          )"
+
+          aws codeartifact describe-package-version \
+            --domain "$CODEARTIFACT_DOMAIN" \
+            --domain-owner "$CODEARTIFACT_DOMAIN_OWNER" \
+            --repository "$CODEARTIFACT_REPOSITORY" \
+            --format npm \
+            --namespace bbc \
+            --package a11y \
+            --package-version "$package_version"
+
+      - name: Write workflow summary
+        if: always()
+        shell: bash
+        run: |
+          package_version="$(
+            node -p "require('./package.json').version"
+          )"
+
+          {
+            echo "## CodeArtifact package test"
+            echo
+            echo "- Package: \`@bbc/a11y\`"
+            echo "- Version: \`${package_version}\`"
+            echo "- Marker: \`${{ inputs.test_marker }}\`"
+            echo "- Publish requested: \`${{ inputs.publish }}\`"
+            echo "- Repository: \`${CODEARTIFACT_REPOSITORY}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

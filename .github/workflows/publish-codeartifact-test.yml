@@ -7,13 +7,11 @@ on:
         description: "Unique test version, for example 3.0.0-codeartifact-test.1"
         required: true
         type: string
-
       test_marker:
         description: "Marker included in package.json to identify this build"
         required: true
         default: "first-test"
         type: string
-
       publish:
         description: "Publish package after validation"
         required: true
@@ -32,7 +30,7 @@ jobs:
   validate-and-publish:
     name: Validate and publish
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     env:
       AWS_REGION: ${{ vars.CODEARTIFACT_REGION }}
@@ -70,6 +68,131 @@ jobs:
             echo "::error::CODEARTIFACT_DOMAIN_OWNER must be a 12-digit AWS account ID"
             exit 1
           fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          node -e "console.log('Electron binary:', require('electron'))"
+
+      - name: Configure Electron sandbox and virtual display
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          electron_package_dir="$(
+            node -p "require('path').dirname(require.resolve('electron/package.json'))"
+          )"
+          chrome_sandbox="${electron_package_dir}/dist/chrome-sandbox"
+
+          if [[ ! -f "$chrome_sandbox" ]]; then
+            echo "::error::Electron chrome-sandbox was not found at ${chrome_sandbox}"
+            exit 1
+          fi
+
+          sudo chown root:root "$chrome_sandbox"
+          sudo chmod 4755 "$chrome_sandbox"
+
+          sandbox_owner="$(stat -c '%U:%G' "$chrome_sandbox")"
+          sandbox_mode="$(stat -c '%a' "$chrome_sandbox")"
+
+          echo "Electron sandbox: ${chrome_sandbox}"
+          echo "Owner: ${sandbox_owner}"
+          echo "Mode: ${sandbox_mode}"
+
+          if [[ "$sandbox_owner" != "root:root" || "$sandbox_mode" != "4755" ]]; then
+            echo "::error::Electron sandbox permissions were not configured correctly"
+            exit 1
+          fi
+
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes xvfb
+          fi
+
+      - name: Validate package and prepare test version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.package_version }}
+          TEST_MARKER: ${{ inputs.test_marker }}
+        run: |
+          set -euo pipefail
+
+          actual_package_name="$(node -p "require('./package.json').name")"
+
+          if [[ "$actual_package_name" != "$EXPECTED_PACKAGE_NAME" ]]; then
+            echo "::error::Expected ${EXPECTED_PACKAGE_NAME}, found ${actual_package_name}"
+            exit 1
+          fi
+
+          if [[ ! "$REQUESTED_VERSION" =~ ^3\.0\.0-codeartifact-test\.[0-9]+$ ]]; then
+            echo "::error::Version must match 3.0.0-codeartifact-test.N"
+            exit 1
+          fi
+
+          if [[ -z "$TEST_MARKER" ]]; then
+            echo "::error::test_marker cannot be empty"
+            exit 1
+          fi
+
+          npm version "$REQUESTED_VERSION" --no-git-tag-version
+
+          node - <<'NODE'
+          const fs = require("fs");
+          const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
+
+          packageJson.codeartifactTest = {
+            marker: process.env.TEST_MARKER,
+            repository: process.env.GITHUB_REPOSITORY,
+            ref: process.env.GITHUB_REF,
+            commit: process.env.GITHUB_SHA,
+            runId: process.env.GITHUB_RUN_ID
+          };
+
+          fs.writeFileSync(
+            "package.json",
+            `${JSON.stringify(packageJson, null, 2)}\n`
+          );
+          NODE
+
+          echo "Prepared package:"
+          node - <<'NODE'
+          const pkg = require("./package.json");
+          console.log(JSON.stringify({
+            name: pkg.name,
+            version: pkg.version,
+            codeartifactTest: pkg.codeartifactTest
+          }, null, 2));
+          NODE
+
+      - name: Run package tests
+        shell: bash
+        env:
+          CI: "true"
+        run: |
+          set -euo pipefail
+
+          if node -e '
+            const scripts = require("./package.json").scripts || {};
+            process.exit(scripts.test ? 0 : 1);
+          '; then
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" npm test
+          else
+            echo "No npm test script is defined; skipping package tests."
+          fi
+
+      - name: Check npm package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --dry-run
 
       - name: Inspect GitHub OIDC claims
         uses: actions/github-script@v7
@@ -112,120 +235,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          aws sts get-caller-identity
-
           assumed_arn="$(
             aws sts get-caller-identity \
               --query Arn \
               --output text
           )"
 
+          echo "Assumed identity: ${assumed_arn}"
+
           if [[ "$assumed_arn" != *":assumed-role/CodeArtifact-Team-Publisher/"* ]]; then
             echo "::error::Unexpected assumed identity: ${assumed_arn}"
             exit 1
           fi
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-
-      - name: Install dependencies
-        shell: bash
-        env:
-          ELECTRON_DISABLE_SECURITY_WARNINGS: "true"
-        run: |
-          set -euo pipefail
-          npm ci
-          node -e "console.log(require('electron'))"
-
-      - name: Validate package and prepare test version
-        shell: bash
-        env:
-          REQUESTED_VERSION: ${{ inputs.package_version }}
-          TEST_MARKER: ${{ inputs.test_marker }}
-        run: |
-          set -euo pipefail
-
-          actual_package_name="$(
-            node -p "require('./package.json').name"
-          )"
-
-          if [[ "$actual_package_name" != "$EXPECTED_PACKAGE_NAME" ]]; then
-            echo "::error::Expected ${EXPECTED_PACKAGE_NAME}, found ${actual_package_name}"
-            exit 1
-          fi
-
-          if [[ ! "$REQUESTED_VERSION" =~ ^3\.0\.0-codeartifact-test\.[0-9]+$ ]]; then
-            echo "::error::Version must match 3.0.0-codeartifact-test.N"
-            exit 1
-          fi
-
-          if [[ -z "$TEST_MARKER" ]]; then
-            echo "::error::test_marker cannot be empty"
-            exit 1
-          fi
-
-          npm version "$REQUESTED_VERSION" --no-git-tag-version
-
-          node - <<'NODE'
-          const fs = require("fs");
-
-          const packageJson = JSON.parse(
-            fs.readFileSync("package.json", "utf8")
-          );
-
-          packageJson.codeartifactTest = {
-            marker: process.env.TEST_MARKER,
-            repository: process.env.GITHUB_REPOSITORY,
-            ref: process.env.GITHUB_REF,
-            commit: process.env.GITHUB_SHA,
-            runId: process.env.GITHUB_RUN_ID
-          };
-
-          fs.writeFileSync(
-            "package.json",
-            `${JSON.stringify(packageJson, null, 2)}\n`
-          );
-          NODE
-
-          echo "Prepared package:"
-          node - <<'NODE'
-          const pkg = require("./package.json");
-
-          console.log(
-            JSON.stringify(
-              {
-                name: pkg.name,
-                version: pkg.version,
-                codeartifactTest: pkg.codeartifactTest
-              },
-              null,
-              2
-            )
-          );
-          NODE
-
-      - name: Run package tests
-        shell: bash
-        run: |
-          set -euo pipefail
-      
-          if node -e '
-            const scripts = require("./package.json").scripts || {};
-            process.exit(scripts.test ? 0 : 1);
-          '; then
-            xvfb-run --auto-servernum npm test
-          else
-            echo "No npm test script is defined; skipping package tests."
-          fi
-
-      - name: Check npm package contents
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm pack --dry-run
 
       - name: Retrieve CodeArtifact endpoint and authorization token
         shell: bash
@@ -269,12 +290,10 @@ jobs:
             echo "//${registry_host_path}:_authToken=${authorization_token}"
           } > "$RUNNER_TEMP/codeartifact.npmrc"
 
+          chmod 600 "$RUNNER_TEMP/codeartifact.npmrc"
           echo "::add-mask::$authorization_token"
-          echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/codeartifact.npmrc" \
-            >> "$GITHUB_ENV"
-          echo "CODEARTIFACT_NPM_ENDPOINT=$repository_endpoint" \
-            >> "$GITHUB_ENV"
-
+          echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/codeartifact.npmrc" >> "$GITHUB_ENV"
+          echo "CODEARTIFACT_NPM_ENDPOINT=$repository_endpoint" >> "$GITHUB_ENV"
           echo "CodeArtifact npm endpoint configured successfully."
 
       - name: Confirm CodeArtifact repository access
@@ -296,9 +315,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          package_version="$(
-            node -p "require('./package.json').version"
-          )"
+          package_version="$(node -p "require('./package.json').version")"
 
           set +e
           describe_output="$(
@@ -333,9 +350,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          npm publish \
-            --registry "$CODEARTIFACT_NPM_ENDPOINT"
+          npm publish --registry "$CODEARTIFACT_NPM_ENDPOINT"
 
       - name: Verify published package version
         if: ${{ inputs.publish }}
@@ -343,9 +358,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          package_version="$(
-            node -p "require('./package.json').version"
-          )"
+          package_version="$(node -p "require('./package.json').version")"
 
           aws codeartifact describe-package-version \
             --domain "$CODEARTIFACT_DOMAIN" \
@@ -391,3 +404,9 @@ jobs:
             echo "- GitHub repository: \`${GITHUB_REPOSITORY}\`"
             echo "- Git ref: \`${GITHUB_REF}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary npm credentials
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/codeartifact.npmrc"

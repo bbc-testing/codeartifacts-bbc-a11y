@@ -4,16 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       package_version:
-        description: "Unique test version, for example 3.0.0-codeartifact-test.1"
+        description: "Unique test version, for example 3.0.0-codeartifact-test.2"
         required: true
         type: string
+
       test_marker:
         description: "Marker included in package.json to identify this build"
         required: true
-        default: "first-test"
+        default: "codeartifact-publish-test"
         type: string
+
       publish:
-        description: "Publish package after validation"
+        description: "Publish the generated tarball to CodeArtifact"
         required: true
         default: false
         type: boolean
@@ -27,16 +29,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate-and-publish:
-    name: Validate and publish
+  pack-and-publish:
+    name: Pack and publish
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     env:
       AWS_REGION: ${{ vars.CODEARTIFACT_REGION }}
       CODEARTIFACT_DOMAIN: ${{ vars.CODEARTIFACT_DOMAIN }}
       CODEARTIFACT_DOMAIN_OWNER: ${{ vars.CODEARTIFACT_DOMAIN_OWNER }}
       CODEARTIFACT_REPOSITORY: ${{ vars.CODEARTIFACT_REPOSITORY }}
+
       PUBLISHER_ROLE_ARN: arn:aws:iam::230027226493:role/CodeArtifact-Team-Publisher
       EXPECTED_PACKAGE_NAME: "@bbc/a11y"
 
@@ -44,7 +47,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Validate required GitHub variables
+      - name: Validate required configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -73,49 +76,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm ci
-          node -e "console.log('Electron binary:', require('electron'))"
-
-      - name: Configure Electron sandbox and virtual display
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          electron_package_dir="$(
-            node -p "require('path').dirname(require.resolve('electron/package.json'))"
-          )"
-          chrome_sandbox="${electron_package_dir}/dist/chrome-sandbox"
-
-          if [[ ! -f "$chrome_sandbox" ]]; then
-            echo "::error::Electron chrome-sandbox was not found at ${chrome_sandbox}"
-            exit 1
-          fi
-
-          sudo chown root:root "$chrome_sandbox"
-          sudo chmod 4755 "$chrome_sandbox"
-
-          sandbox_owner="$(stat -c '%U:%G' "$chrome_sandbox")"
-          sandbox_mode="$(stat -c '%a' "$chrome_sandbox")"
-
-          echo "Electron sandbox: ${chrome_sandbox}"
-          echo "Owner: ${sandbox_owner}"
-          echo "Mode: ${sandbox_mode}"
-
-          if [[ "$sandbox_owner" != "root:root" || "$sandbox_mode" != "4755" ]]; then
-            echo "::error::Electron sandbox permissions were not configured correctly"
-            exit 1
-          fi
-
-          if ! command -v xvfb-run >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install --yes xvfb
-          fi
 
       - name: Validate package and prepare test version
         shell: bash
@@ -142,18 +102,24 @@ jobs:
             exit 1
           fi
 
-          npm version "$REQUESTED_VERSION" --no-git-tag-version
+          npm version "$REQUESTED_VERSION" \
+            --no-git-tag-version \
+            --ignore-scripts
 
           node - <<'NODE'
           const fs = require("fs");
-          const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
+
+          const packageJson = JSON.parse(
+            fs.readFileSync("package.json", "utf8")
+          );
 
           packageJson.codeartifactTest = {
             marker: process.env.TEST_MARKER,
             repository: process.env.GITHUB_REPOSITORY,
             ref: process.env.GITHUB_REF,
             commit: process.env.GITHUB_SHA,
-            runId: process.env.GITHUB_RUN_ID
+            runId: process.env.GITHUB_RUN_ID,
+            runAttempt: process.env.GITHUB_RUN_ATTEMPT
           };
 
           fs.writeFileSync(
@@ -165,6 +131,7 @@ jobs:
           echo "Prepared package:"
           node - <<'NODE'
           const pkg = require("./package.json");
+
           console.log(JSON.stringify({
             name: pkg.name,
             version: pkg.version,
@@ -172,27 +139,60 @@ jobs:
           }, null, 2));
           NODE
 
-      - name: Run package tests
+      - name: Create npm package tarball
+        id: pack
         shell: bash
-        env:
-          CI: "true"
         run: |
           set -euo pipefail
 
-          if node -e '
-            const scripts = require("./package.json").scripts || {};
-            process.exit(scripts.test ? 0 : 1);
-          '; then
-            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" npm test
-          else
-            echo "No npm test script is defined; skipping package tests."
+          pack_output="$(
+            npm pack \
+              --ignore-scripts \
+              --json
+          )"
+
+          echo "$pack_output"
+
+          package_tarball="$(
+            PACK_OUTPUT="$pack_output" node - <<'NODE'
+          const result = JSON.parse(process.env.PACK_OUTPUT);
+
+          if (!Array.isArray(result) || !result[0]?.filename) {
+            throw new Error("npm pack did not return a package filename");
+          }
+
+          process.stdout.write(result[0].filename);
+          NODE
+          )"
+
+          if [[ ! -f "$package_tarball" ]]; then
+            echo "::error::Generated package tarball was not found: ${package_tarball}"
+            exit 1
           fi
 
-      - name: Check npm package contents
+          package_name="$(
+            node -p "require('./package.json').name"
+          )"
+
+          package_version="$(
+            node -p "require('./package.json').version"
+          )"
+
+          echo "Generated tarball: ${package_tarball}"
+          echo "Package: ${package_name}@${package_version}"
+          ls -lh "$package_tarball"
+
+          echo "package_tarball=$package_tarball" >> "$GITHUB_OUTPUT"
+          echo "package_name=$package_name" >> "$GITHUB_OUTPUT"
+          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
+
+      - name: Display tarball contents
         shell: bash
+        env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.package_tarball }}
         run: |
           set -euo pipefail
-          npm pack --dry-run
+          tar -tzf "$PACKAGE_TARBALL"
 
       - name: Inspect GitHub OIDC claims
         uses: actions/github-script@v7
@@ -217,7 +217,6 @@ jobs:
             core.info(`Repository owner: ${payload.repository_owner}`);
             core.info(`Repository visibility: ${payload.repository_visibility}`);
             core.info(`Ref: ${payload.ref}`);
-            core.info(`Environment: ${payload.environment || "not used"}`);
             core.info(`Job workflow ref: ${payload.job_workflow_ref}`);
 
       - name: Configure AWS credentials using GitHub OIDC
@@ -248,7 +247,7 @@ jobs:
             exit 1
           fi
 
-      - name: Retrieve CodeArtifact endpoint and authorization token
+      - name: Configure npm for CodeArtifact
         shell: bash
         run: |
           set -euo pipefail
@@ -291,9 +290,11 @@ jobs:
           } > "$RUNNER_TEMP/codeartifact.npmrc"
 
           chmod 600 "$RUNNER_TEMP/codeartifact.npmrc"
+
           echo "::add-mask::$authorization_token"
           echo "NPM_CONFIG_USERCONFIG=$RUNNER_TEMP/codeartifact.npmrc" >> "$GITHUB_ENV"
           echo "CODEARTIFACT_NPM_ENDPOINT=$repository_endpoint" >> "$GITHUB_ENV"
+
           echo "CodeArtifact npm endpoint configured successfully."
 
       - name: Confirm CodeArtifact repository access
@@ -312,10 +313,10 @@ jobs:
 
       - name: Confirm package version does not already exist
         shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.pack.outputs.package_version }}
         run: |
           set -euo pipefail
-
-          package_version="$(node -p "require('./package.json').version")"
 
           set +e
           describe_output="$(
@@ -326,39 +327,44 @@ jobs:
               --format npm \
               --namespace bbc \
               --package a11y \
-              --package-version "$package_version" \
+              --package-version "$PACKAGE_VERSION" \
               2>&1
           )"
           describe_exit_code=$?
           set -e
 
           if [[ "$describe_exit_code" -eq 0 ]]; then
-            echo "::error::Version already exists: @bbc/a11y@${package_version}"
+            echo "::error::Version already exists: @bbc/a11y@${PACKAGE_VERSION}"
             exit 1
           fi
 
           if grep -q "ResourceNotFoundException" <<< "$describe_output"; then
-            echo "Version is available: @bbc/a11y@${package_version}"
+            echo "Version is available: @bbc/a11y@${PACKAGE_VERSION}"
           else
             echo "::error::Unable to determine whether the package version exists"
             echo "$describe_output"
             exit "$describe_exit_code"
           fi
 
-      - name: Publish package to CodeArtifact
+      - name: Publish tarball to CodeArtifact
         if: ${{ inputs.publish }}
         shell: bash
+        env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.package_tarball }}
         run: |
           set -euo pipefail
-          npm publish --registry "$CODEARTIFACT_NPM_ENDPOINT"
+
+          npm publish "$PACKAGE_TARBALL" \
+            --ignore-scripts \
+            --registry "$CODEARTIFACT_NPM_ENDPOINT"
 
       - name: Verify published package version
         if: ${{ inputs.publish }}
         shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.pack.outputs.package_version }}
         run: |
           set -euo pipefail
-
-          package_version="$(node -p "require('./package.json').version")"
 
           aws codeartifact describe-package-version \
             --domain "$CODEARTIFACT_DOMAIN" \
@@ -367,10 +373,10 @@ jobs:
             --format npm \
             --namespace bbc \
             --package a11y \
-            --package-version "$package_version"
+            --package-version "$PACKAGE_VERSION"
 
           npm view \
-            "@bbc/a11y@${package_version}" \
+            "@bbc/a11y@${PACKAGE_VERSION}" \
             name \
             version \
             dist.tarball \
@@ -379,23 +385,27 @@ jobs:
       - name: Dry-run result
         if: ${{ !inputs.publish }}
         shell: bash
+        env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.package_tarball }}
         run: |
-          echo "Dry run completed successfully. No package was published."
+          set -euo pipefail
+          echo "Dry run completed successfully."
+          echo "Generated package: ${PACKAGE_TARBALL}"
+          echo "No package was published."
 
       - name: Write workflow summary
         if: always()
         shell: bash
+        env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.package_tarball }}
+          PACKAGE_VERSION: ${{ steps.pack.outputs.package_version }}
         run: |
-          package_version="$(
-            node -p "require('./package.json').version" 2>/dev/null \
-              || printf '%s' '${{ inputs.package_version }}'
-          )"
-
           {
             echo "## CodeArtifact package test"
             echo
             echo "- Package: \`@bbc/a11y\`"
-            echo "- Version: \`${package_version}\`"
+            echo "- Version: \`${PACKAGE_VERSION:-${{ inputs.package_version }}}\`"
+            echo "- Tarball: \`${PACKAGE_TARBALL:-not generated}\`"
             echo "- Marker: \`${{ inputs.test_marker }}\`"
             echo "- Publish requested: \`${{ inputs.publish }}\`"
             echo "- AWS role: \`${PUBLISHER_ROLE_ARN}\`"
